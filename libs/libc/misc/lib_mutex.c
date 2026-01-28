@@ -25,6 +25,8 @@
  ****************************************************************************/
 
 #include <errno.h>
+#include <execinfo.h>
+#include <time.h>
 
 #include <nuttx/sched.h>
 #include <nuttx/clock.h>
@@ -48,17 +50,16 @@
  *
  ****************************************************************************/
 
-#if CONFIG_LIBC_MUTEX_BACKTRACE > 0
+#ifdef CONFIG_LIBC_MUTEX_BACKTRACE
 void nxmutex_add_backtrace(FAR mutex_t *mutex)
 {
-  int n;
+  mutex->stack = backtrace_record(0);
+}
 
-  n = sched_backtrace(nxmutex_get_holder(&mutex), mutex->backtrace,
-                      CONFIG_LIBC_MUTEX_BACKTRACE, 0);
-  if (n < CONFIG_LIBC_MUTEX_BACKTRACE)
-    {
-      mutex->backtrace[n] = NULL;
-    }
+void nxmutex_remove_backtrace(FAR mutex_t *mutex)
+{
+  backtrace_remove(mutex->stack);
+  mutex->stack = NULL;
 }
 #endif
 
@@ -85,16 +86,15 @@ int nxmutex_init(FAR mutex_t *mutex)
 {
   int ret = nxsem_init(&mutex->sem, 0, NXSEM_NO_MHOLDER);
 
-  if (ret < 0)
+  if (ret >= 0)
     {
-      return ret;
+#ifdef CONFIG_PRIORITY_INHERITANCE
+      nxsem_set_protocol(&mutex->sem, SEM_TYPE_MUTEX | SEM_PRIO_INHERIT);
+#else
+      nxsem_set_protocol(&mutex->sem, SEM_TYPE_MUTEX);
+#endif
     }
 
-#ifdef CONFIG_PRIORITY_INHERITANCE
-  nxsem_set_protocol(&mutex->sem, SEM_TYPE_MUTEX | SEM_PRIO_INHERIT);
-#else
-  nxsem_set_protocol(&mutex->sem, SEM_TYPE_MUTEX);
-#endif
   return ret;
 }
 
@@ -102,7 +102,7 @@ int nxmutex_init(FAR mutex_t *mutex)
  * Name: nxmutex_is_hold
  *
  * Description:
- *   This function check whether the calling thread hold the mutex
+ *   This function check whether the caller hold the mutex
  *   referenced by 'mutex'.
  *
  * Parameters:
@@ -145,22 +145,46 @@ bool nxmutex_is_hold(FAR mutex_t *mutex)
 
 int nxmutex_ticklock(FAR mutex_t *mutex, uint32_t delay)
 {
+  clock_t end;
   int ret;
 
-  /* Wait until we get the lock or until the timeout expires */
-
-  if (delay)
+  if (delay == 0u)
     {
-      ret = nxsem_tickwait(&mutex->sem, delay);
+      /* If delay is zero, then this function is equivalent to
+       * sem_trywait()
+       */
+
+      ret = nxsem_trywait(&mutex->sem);
+      if (ret >= 0)
+        {
+          nxmutex_add_backtrace(mutex);
+        }
     }
   else
     {
-      ret = nxsem_trywait(&mutex->sem);
-    }
+      /* Wait until we get the lock or until the timeout expires */
 
-  if (ret >= 0)
-    {
-      nxmutex_add_backtrace(mutex);
+      end = clock() + delay + 1u; /* Similar to clock_delay2abstick(delay) */
+
+      for (; ; )
+        {
+          ret = nxsem_tickwait(&mutex->sem, delay);
+          if (ret >= 0)
+            {
+              nxmutex_add_backtrace(mutex);
+              break;
+            }
+          else if (ret != -EINTR && ret != -ECANCELED)
+            {
+              break;
+            }
+
+          delay = end - clock();
+          if ((int32_t)delay < 0)
+            {
+              delay = 0u;
+            }
+        }
     }
 
   return ret;
@@ -198,18 +222,26 @@ int nxmutex_clocklock(FAR mutex_t *mutex, clockid_t clockid,
 
   /* Wait until we get the lock or until the timeout expires */
 
-  if (abstime)
+  for (; ; )
     {
-      ret = nxsem_clockwait(&mutex->sem, clockid, abstime);
-    }
-  else
-    {
-      ret = nxsem_wait(&mutex->sem);
-    }
+      if (abstime)
+        {
+          ret = nxsem_clockwait(&mutex->sem, clockid, abstime);
+        }
+      else
+        {
+          ret = nxsem_wait(&mutex->sem);
+        }
 
-  if (ret >= 0)
-    {
-      nxmutex_add_backtrace(mutex);
+      if (ret >= 0)
+        {
+          nxmutex_add_backtrace(mutex);
+          break;
+        }
+      else if (ret != -EINTR && ret != -ECANCELED)
+        {
+          break;
+        }
     }
 
   return ret;
@@ -333,50 +365,6 @@ int nxrmutex_trylock(FAR rmutex_t *rmutex)
 }
 
 /****************************************************************************
- * Name: nxrmutex_ticklock
- *
- * Description:
- *   This function attempts to lock the mutex referenced by 'mutex'.  If the
- *   mutex value is (<=) zero, then the calling task will not return until it
- *   successfully acquires the lock or timed out
- *
- * Input Parameters:
- *   rmutex  - Rmutex object
- *   delay   - Ticks to wait from the start time until the semaphore is
- *             posted.  If ticks is zero, then this function is equivalent
- *             to nxrmutex_trylock().
- *
- * Returned Value:
- *   OK        The mutex successfully acquires
- *   EINVAL    The mutex argument does not refer to a valid mutex.  Or the
- *             thread would have blocked, and the abstime parameter specified
- *             a nanoseconds field value less than zero or greater than or
- *             equal to 1000 million.
- *   ETIMEDOUT The mutex could not be locked before the specified timeout
- *             expired.
- *   EDEADLK   A deadlock condition was detected.
- *
- ****************************************************************************/
-
-int nxrmutex_ticklock(FAR rmutex_t *rmutex, uint32_t delay)
-{
-  int ret = 0;
-
-  if (!nxrmutex_is_hold(rmutex))
-    {
-      ret = nxmutex_ticklock(&rmutex->mutex, delay);
-    }
-
-  if (ret >= 0)
-    {
-      DEBUGASSERT(rmutex->count < UINT_MAX);
-      ++rmutex->count;
-    }
-
-  return ret;
-}
-
-/****************************************************************************
  * Name: nxrmutex_clocklock
  *
  * Description:
@@ -488,9 +476,9 @@ int nxrmutex_unlock(FAR rmutex_t *rmutex)
 {
   int ret = OK;
 
-  DEBUGASSERT(rmutex->count > 0);
+  DEBUGASSERT(rmutex->count > 0u);
 
-  if (--rmutex->count == 0)
+  if (--rmutex->count == 0u)
     {
       ret = nxmutex_unlock(&rmutex->mutex);
       if (ret < 0)
@@ -523,11 +511,11 @@ int nxrmutex_breaklock(FAR rmutex_t *rmutex, FAR unsigned int *count)
 {
   int ret = OK;
 
-  *count = 0;
+  *count = 0u;
   if (nxrmutex_is_hold(rmutex))
     {
       *count = rmutex->count;
-      rmutex->count = 0;
+      rmutex->count = 0u;
       ret = nxmutex_unlock(&rmutex->mutex);
       if (ret < 0)
         {
@@ -559,7 +547,7 @@ int nxrmutex_restorelock(FAR rmutex_t *rmutex, unsigned int count)
 {
   int ret = OK;
 
-  if (count != 0)
+  if (count != 0u)
     {
       ret = nxmutex_lock(&rmutex->mutex);
       if (ret >= 0)
